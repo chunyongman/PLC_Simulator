@@ -63,20 +63,20 @@ class ESSPLCSimulator:
         # 장비 상태 (3 SWP, 3 FWP, 4 Fans)
         self.equipment = {
             # Sea Water Pumps
-            'SWP1': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 45.5},
-            'SWP2': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 46.2},
-            'SWP3': {'running': False, 'ess_on': False, 'abnormal': False, 'hz': 0.0},
+            'SWP1': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 45.5, 'auto_mode': True, 'vfd_mode': True},
+            'SWP2': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 46.2, 'auto_mode': True, 'vfd_mode': True},
+            'SWP3': {'running': False, 'ess_on': False, 'abnormal': False, 'hz': 0.0, 'auto_mode': True, 'vfd_mode': True},
 
             # Fresh Water Pumps
-            'FWP1': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 48.1},
-            'FWP2': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 47.8},
-            'FWP3': {'running': False, 'ess_on': False, 'abnormal': False, 'hz': 0.0},
+            'FWP1': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 48.1, 'auto_mode': True, 'vfd_mode': True},
+            'FWP2': {'running': True, 'ess_on': True, 'abnormal': False, 'hz': 47.8, 'auto_mode': True, 'vfd_mode': True},
+            'FWP3': {'running': False, 'ess_on': False, 'abnormal': False, 'hz': 0.0, 'auto_mode': True, 'vfd_mode': True},
 
             # E/R Fans
-            'FAN1': {'running_fwd': True, 'running_bwd': False, 'abnormal': False, 'hz': 50.0},
-            'FAN2': {'running_fwd': True, 'running_bwd': False, 'abnormal': False, 'hz': 49.5},
-            'FAN3': {'running_fwd': False, 'running_bwd': False, 'abnormal': False, 'hz': 0.0},
-            'FAN4': {'running_fwd': False, 'running_bwd': False, 'abnormal': False, 'hz': 0.0}
+            'FAN1': {'running_fwd': True, 'running_bwd': False, 'abnormal': False, 'hz': 50.0, 'auto_mode': True, 'vfd_mode': True},
+            'FAN2': {'running_fwd': True, 'running_bwd': False, 'abnormal': False, 'hz': 49.5, 'auto_mode': True, 'vfd_mode': True},
+            'FAN3': {'running_fwd': False, 'running_bwd': False, 'abnormal': False, 'hz': 0.0, 'auto_mode': True, 'vfd_mode': True},
+            'FAN4': {'running_fwd': False, 'running_bwd': False, 'abnormal': False, 'hz': 0.0, 'auto_mode': True, 'vfd_mode': True}
         }
 
         # 센서 베이스 값
@@ -323,17 +323,125 @@ class ESSPLCSimulator:
 
             self.store.setValues(3, start_addr, vfd_data)
 
+        # AUTO/MANUAL, VFD/BYPASS 코일 업데이트
+        for i, (eq_name, _) in enumerate(vfd_configs):
+            eq = self.equipment[eq_name]
+            # AUTO/MANUAL 코일 (64160 + eq_index)
+            auto_coil_addr = 64160 + i
+            self.store.setValues(1, auto_coil_addr, [1 if eq.get('auto_mode', True) else 0])
+
+            # VFD/BYPASS 코일 (64320 + eq_index)
+            vfd_coil_addr = 64320 + i
+            self.store.setValues(1, vfd_coil_addr, [1 if eq.get('vfd_mode', True) else 0])
+
     def monitor_commands(self):
         """PLC 명령 모니터링 (HMI에서 전송하는 명령 처리)"""
         print("[시작] 명령 모니터링 스레드")
 
+        # 장비 인덱스 맵
+        equipment_names = ['SWP1', 'SWP2', 'SWP3', 'FWP1', 'FWP2', 'FWP3',
+                          'FAN1', 'FAN2', 'FAN3', 'FAN4']
+
         while self.running:
             try:
-                # K4004~K4005: 제어 명령
-                # 실제 구현은 HMI에서 Coil Write 명령을 받아 처리
-                time.sleep(0.5)
+                # HMI modbus_client.py의 코일 주소 매핑:
+                # START 코일: 64064 + (eq_index * 2)
+                # STOP 코일: 64064 + (eq_index * 2) + 1
+                # FAN BWD 코일: 64084 + (fan_index - 6)
+                # AUTO/MANUAL 코일: 64160 + eq_index (True=AUTO, False=MANUAL)
+                # VFD/BYPASS 코일: 64320 + eq_index (True=VFD, False=BYPASS)
+
+                for i, eq_name in enumerate(equipment_names):
+                    # START 코일 확인
+                    start_coil_addr = 64064 + (i * 2)
+                    start_coil_value = self.store.getValues(1, start_coil_addr, 1)[0]
+
+                    # STOP 코일 확인
+                    stop_coil_addr = 64064 + (i * 2) + 1
+                    stop_coil_value = self.store.getValues(1, stop_coil_addr, 1)[0]
+
+                    # Pump 장비 (SWP1~3, FWP1~3)
+                    if i < 6:
+                        if start_coil_value:
+                            # START 명령
+                            if not self.equipment[eq_name]['running']:
+                                self.equipment[eq_name]['running'] = True
+                                self.equipment[eq_name]['ess_on'] = True
+                                self.equipment[eq_name]['hz'] = 45.0 + random.uniform(-2, 2)
+                                print(f"[제어] {eq_name} START 명령 수신 → 운전 시작 ({self.equipment[eq_name]['hz']:.1f} Hz)")
+                            # 코일 리셋
+                            self.store.setValues(1, start_coil_addr, [0])
+
+                        if stop_coil_value:
+                            # STOP 명령
+                            if self.equipment[eq_name]['running']:
+                                self.equipment[eq_name]['running'] = False
+                                self.equipment[eq_name]['ess_on'] = False
+                                self.equipment[eq_name]['hz'] = 0.0
+                                print(f"[제어] {eq_name} STOP 명령 수신 → 운전 정지")
+                            # 코일 리셋
+                            self.store.setValues(1, stop_coil_addr, [0])
+
+                    # Fan 장비 (FAN1~4)
+                    else:
+                        # FWD START
+                        if start_coil_value:
+                            if not self.equipment[eq_name]['running_fwd']:
+                                self.equipment[eq_name]['running_fwd'] = True
+                                self.equipment[eq_name]['running_bwd'] = False
+                                self.equipment[eq_name]['hz'] = 45.0 + random.uniform(-2, 2)
+                                print(f"[제어] {eq_name} FWD START 명령 수신 → 정방향 운전 시작 ({self.equipment[eq_name]['hz']:.1f} Hz)")
+                            # 코일 리셋
+                            self.store.setValues(1, start_coil_addr, [0])
+
+                        # STOP
+                        if stop_coil_value:
+                            if self.equipment[eq_name]['running_fwd'] or self.equipment[eq_name]['running_bwd']:
+                                self.equipment[eq_name]['running_fwd'] = False
+                                self.equipment[eq_name]['running_bwd'] = False
+                                self.equipment[eq_name]['hz'] = 0.0
+                                print(f"[제어] {eq_name} STOP 명령 수신 → 운전 정지")
+                            # 코일 리셋
+                            self.store.setValues(1, stop_coil_addr, [0])
+
+                        # BWD START (Fan only)
+                        bwd_coil_addr = 64084 + (i - 6)
+                        bwd_coil_value = self.store.getValues(1, bwd_coil_addr, 1)[0]
+                        if bwd_coil_value:
+                            if not self.equipment[eq_name]['running_bwd']:
+                                self.equipment[eq_name]['running_fwd'] = False
+                                self.equipment[eq_name]['running_bwd'] = True
+                                self.equipment[eq_name]['hz'] = 45.0 + random.uniform(-2, 2)
+                                print(f"[제어] {eq_name} BWD START 명령 수신 → 역방향 운전 시작 ({self.equipment[eq_name]['hz']:.1f} Hz)")
+                            # 코일 리셋
+                            self.store.setValues(1, bwd_coil_addr, [0])
+
+                    # AUTO/MANUAL 모드 확인 (모든 장비 공통)
+                    auto_coil_addr = 64160 + i
+                    auto_coil_value = self.store.getValues(1, auto_coil_addr, 1)[0]
+                    # 코일 값이 변경되었는지 확인
+                    new_auto_mode = bool(auto_coil_value)
+                    if self.equipment[eq_name]['auto_mode'] != new_auto_mode:
+                        self.equipment[eq_name]['auto_mode'] = new_auto_mode
+                        mode_str = "AUTO" if new_auto_mode else "MANUAL"
+                        print(f"[제어] {eq_name} {mode_str} 모드 설정")
+
+                    # VFD/BYPASS 모드 확인 (모든 장비 공통)
+                    vfd_coil_addr = 64320 + i
+                    vfd_coil_value = self.store.getValues(1, vfd_coil_addr, 1)[0]
+                    # 코일 값이 변경되었는지 확인
+                    new_vfd_mode = bool(vfd_coil_value)
+                    if self.equipment[eq_name]['vfd_mode'] != new_vfd_mode:
+                        self.equipment[eq_name]['vfd_mode'] = new_vfd_mode
+                        mode_str = "VFD" if new_vfd_mode else "BYPASS"
+                        print(f"[제어] {eq_name} {mode_str} 모드 설정")
+
+                time.sleep(0.1)  # 100ms마다 체크
+
             except Exception as e:
                 print(f"[ERROR] 명령 모니터링 오류: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(1)
 
     def print_status(self):
