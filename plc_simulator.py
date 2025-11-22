@@ -281,26 +281,83 @@ class ESSPLCSimulator:
             ('FAN1', 208), ('FAN2', 216), ('FAN3', 224), ('FAN4', 232)
         ]
 
-        for eq_name, start_addr in vfd_configs:
+        for i, (eq_name, start_addr) in enumerate(vfd_configs):
             eq = self.equipment[eq_name]
             running = eq.get('running', False) or eq.get('running_fwd', False) or eq.get('running_bwd', False)
 
-            # Frequency (Hz * 10)
-            frequency = self.hz_to_raw(eq['hz'])
+            # ================================================================
+            # 1단계: PLC가 Edge AI 목표 주파수를 VFD에 전송 (명령)
+            # ================================================================
+            vfd_command_freq = eq['hz']  # 현재 VFD 명령 주파수
 
-            # Power (kW)
+            # AUTO 모드이고 VFD 모드일 때만 Edge AI 주파수 사용
+            auto_mode = eq.get('auto_mode', True)
+            vfd_mode = eq.get('vfd_mode', True)
+
+            if auto_mode and vfd_mode and running:
+                # Edge AI 목표 주파수 읽기 (레지스터 5000-5009)
+                try:
+                    ai_freq_raw = self.store.getValues(3, 5000 + i, 1)[0]
+                    if ai_freq_raw > 0:  # AI 주파수가 설정되어 있으면
+                        ai_freq_hz = ai_freq_raw / 10.0
+                        # AI 목표 주파수로 서서히 변경 (급격한 변화 방지)
+                        if abs(ai_freq_hz - vfd_command_freq) > 0.5:
+                            # 0.5Hz씩 서서히 변경
+                            if ai_freq_hz > vfd_command_freq:
+                                vfd_command_freq = min(vfd_command_freq + 0.5, ai_freq_hz, 60.0)
+                            else:
+                                vfd_command_freq = max(vfd_command_freq - 0.5, ai_freq_hz, 0.0)
+                        else:
+                            vfd_command_freq = ai_freq_hz
+                except:
+                    pass  # AI 주파수 읽기 실패 시 현재 주파수 유지
+
+            # ================================================================
+            # 2단계: VFD 시뮬레이션 - 명령을 받아 실제 모터 제어 후 피드백
+            # ================================================================
+            # 실제 환경: VFD가 PLC 명령을 받아 모터 제어 → 실제 주파수를 PLC로 피드백
+            # 시뮬레이터: 명령값에 약간의 오차 추가 (±0.3Hz, 실제 측정 오차 반영)
             if running:
-                power = int(eq['hz'] * 0.8 + random.uniform(0, 5))
+                vfd_actual_freq = vfd_command_freq + random.uniform(-0.3, 0.3)
+                vfd_actual_freq = max(0.0, min(60.0, vfd_actual_freq))  # 0-60Hz 범위
+            else:
+                vfd_actual_freq = 0.0
+
+            # 명령 주파수를 내부 상태에 저장 (다음 cycle 명령 생성 시 기준)
+            eq['hz'] = vfd_command_freq
+
+            # ================================================================
+            # 3단계: VFD 피드백을 PLC 레지스터 160-239에 저장 (HMI 표시용)
+            # ================================================================
+            # Frequency (Hz * 10) - VFD가 피드백한 실제 주파수
+            frequency = self.hz_to_raw(vfd_actual_freq)
+
+            # Power (kW) - VFD 실제 주파수 기반 전력
+            if running:
+                power = int(vfd_actual_freq * 0.8 + random.uniform(0, 5))
             else:
                 power = 0
 
-            # Savings (kWh) - Edge AI가 계산하므로 여기서는 0으로 설정
-            # Edge AI가 레지스터 5100-5109에 실제 절감량을 쓸 것임
-            savings = 0
+            # Edge AI가 계산한 절감량 읽기 (레지스터 5100-5109)
+            try:
+                savings_kw_raw = self.store.getValues(3, 5100 + i, 1)[0]
+                savings_kw = savings_kw_raw / 10.0  # kW × 10 → kW
+                # kW를 kWh로 변환 (1초마다 업데이트이므로 / 3600)
+                savings = int(savings_kw * 1000)  # 임시로 kW를 정수로 저장
+            except:
+                savings = 0
 
-            # Savings Ratio - Edge AI가 계산 (레지스터 5300-5303)
-            # 여기서는 임시로 0 설정
-            savings_ratio = 0
+            # Edge AI가 계산한 절감률 읽기 (레지스터 5300-5303)
+            try:
+                if i < 3:  # SWP
+                    savings_ratio_raw = self.store.getValues(3, 5301, 1)[0]
+                elif i < 6:  # FWP
+                    savings_ratio_raw = self.store.getValues(3, 5302, 1)[0]
+                else:  # FAN
+                    savings_ratio_raw = self.store.getValues(3, 5303, 1)[0]
+                savings_ratio = savings_ratio_raw / 10  # % × 10 → %
+            except:
+                savings_ratio = 0
 
             # Run Hours - 실제 운전 시간 (누적)
             current_hours = self.store.getValues(3, start_addr + 6, 1)[0]
@@ -311,12 +368,12 @@ class ESSPLCSimulator:
 
             # Data: [Frequency, Power, AvgPower, Savings_L, Savings_H, Ratio, Hours_L, Hours_H]
             vfd_data = [
-                frequency,              # Hz * 10
+                frequency,              # Hz * 10 (Edge AI 목표 주파수 반영됨)
                 power,                  # kW
                 power,                  # Avg kW
-                savings & 0xFFFF,       # Savings Low Word (Edge AI가 계산)
-                (savings >> 16) & 0xFFFF,  # Savings High Word (Edge AI가 계산)
-                savings_ratio,          # Savings Ratio % (Edge AI가 계산)
+                savings & 0xFFFF,       # Savings Low Word (Edge AI 값)
+                (savings >> 16) & 0xFFFF,  # Savings High Word (Edge AI 값)
+                int(savings_ratio),     # Savings Ratio % (Edge AI 값)
                 run_hours & 0xFFFF,     # Run Hours Low
                 (run_hours >> 16) & 0xFFFF  # Run Hours High
             ]
