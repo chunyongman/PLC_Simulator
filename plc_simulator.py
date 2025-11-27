@@ -56,9 +56,26 @@ class ESSPLCSimulator:
         # 시뮬레이션 상태
         self.running = True
 
-        # 알람 시나리오 카운터 (60초마다 알람 조건 생성)
+        # 알람 시나리오 카운터
         self.alarm_scenario_counter = 0
         self.alarm_active = False
+        self.alarm_duration = 0  # 알람 지속 시간
+
+        # 센서 동적 변동을 위한 사이클 변수
+        self.simulation_tick = 0  # 1초마다 증가
+
+        # 온도 사이클 상태 (사인파 기반 변동)
+        # TX4: FWP 제어용 (40~50°C 사이클, 주기 120초)
+        # TX5: SWP 제어용 (32~40°C 사이클, 주기 90초)
+        # TX6: FAN 대수제어 테스트용 (38~48°C, 주기 180초)
+        #      - 38~42°C (60초): AI가 주파수 감소 → 41Hz 도달 → 대수 감소 (4→3→2대)
+        #      - 42~44°C (60초): 정상 범위, 대수 유지
+        #      - 44~48°C (60초): AI가 주파수 증가 → 59Hz 도달 → 대수 증가 (2→3→4대)
+        self.temp_cycle = {
+            'TX4': {'min': 43.0, 'max': 47.0, 'period': 180, 'phase': 0},
+            'TX5': {'min': 33.0, 'max': 37.0, 'period': 180, 'phase': 60},
+            'TX6': {'min': 38.0, 'max': 48.0, 'period': 180, 'phase': 0},
+        }
 
         # 장비 상태 (3 SWP, 3 FWP, 4 Fans)
         self.equipment = {
@@ -95,11 +112,14 @@ class ESSPLCSimulator:
         }
 
         self.base_pressure = {
-            'DPX1': 2.0,  # SW DISCHARGE PRESS: 1.0~3.0 BAR
-            'DPX2': 15.0  # E/R Diff Press (Pa)
+            'PX1': 2.0,  # SW DISCHARGE PRESS: 1.0~3.0 BAR
         }
 
-        self.me_load = 55.0  # M/E Load % (60% 이하)
+        # M/E Load 사이클 (펌프 대수제어 테스트용)
+        # 15~45% (90초): 펌프 1대 (< 30%)
+        # 45~15% (90초): 펌프 2대 (≥ 30%)
+        self.me_load_cycle = {'min': 15.0, 'max': 45.0, 'period': 180, 'phase': 0}
+        self.me_load = 30.0  # 초기값
 
         # Edge AI 결과 저장 레지스터 초기화
         # 5000-5009: AI 목표 주파수 (Hz × 10)
@@ -111,10 +131,37 @@ class ESSPLCSimulator:
         self.store.setValues(3, 5200, [100] * 10)  # VFD 진단 점수 (초기값 100=정상)
         self.store.setValues(3, 5300, [0] * 4)   # 시스템 절감률
 
+        # 알람 시스템 레지스터 초기화
+        # 7000-7009: 알람 임계값 설정 (HMI → PLC)
+        default_thresholds = [
+            300,  # TX1: 30.0°C × 10
+            500,  # TX2: 50.0°C × 10
+            500,  # TX3: 50.0°C × 10
+            500,  # TX4: 50.0°C × 10
+            400,  # TX5: 40.0°C × 10
+            500,  # TX6: 50.0°C × 10
+            400,  # TX7: 40.0°C × 10
+            150,  # PX1 하한: 1.5 bar × 100
+            400,  # PX1 상한: 4.0 bar × 100
+            850,  # PU1 상한: 85.0% × 10
+        ]
+        self.store.setValues(3, 7000, default_thresholds)
+
+        # 7100-7103: 알람 상태 (PLC → HMI)
+        self.store.setValues(3, 7100, [0, 0, 0, 0])  # [온도비트, 압력비트, 미확인개수, 새알람플래그]
+
+        # 7200-7279: 최근 알람 10개 (순환 버퍼)
+        self.store.setValues(3, 7200, [0] * 80)
+
+        # 알람 관리
+        self.recent_alarms = []  # 최근 알람 10개
+        self.alarm_index = 0
+
         print("[OK] 데이터 스토어 초기화 완료")
         print("[INFO] Modbus TCP 서버: 192.168.0.130:502")
         print("[INFO] Node ID: 3")
         print("[INFO] Edge AI 결과 레지스터: 5000-5399 (Ready)")
+        print("[INFO] 알람 시스템 레지스터: 7000-7279 (Ready)")
         print("-" * 70)
 
     def temperature_to_raw(self, temp_celsius):
@@ -137,75 +184,126 @@ class ESSPLCSimulator:
         """주파수를 raw 값으로 변환 (0~100Hz -> 0~1000)"""
         return int(hz * 10)
 
+    def get_cyclic_temp(self, sensor_key):
+        """사인파 기반 온도 사이클 계산"""
+        import math
+        cycle = self.temp_cycle[sensor_key]
+        t = self.simulation_tick + cycle['phase']
+        # 사인파: -1 ~ +1 → min ~ max 범위로 변환
+        sine_value = math.sin(2 * math.pi * t / cycle['period'])
+        mid = (cycle['max'] + cycle['min']) / 2
+        amplitude = (cycle['max'] - cycle['min']) / 2
+        return mid + amplitude * sine_value
+
     def simulate_sensor_values(self):
-        """센서 값 실시간 시뮬레이션"""
+        """센서 값 실시간 시뮬레이션 (동적 변동 + 주기적 알람)"""
         print("[시작] 센서 데이터 시뮬레이션 스레드")
+        print("[INFO] 대수제어 테스트 모드 활성화:")
+        print()
+        print("  📊 FAN 대수제어 (TX6 기반):")
+        print("    - TX6: 38~48°C, 주기 180초")
+        print("    - 38~42°C (60초): AI 주파수 감소 → 41Hz 도달 → FAN 대수 감소 (4→3→2대)")
+        print("    - 42~44°C (60초): 정상 범위 → 대수 유지")
+        print("    - 44~48°C (60초): AI 주파수 증가 → 59Hz 도달 → FAN 대수 증가 (2→3→4대)")
+        print()
+        print("  📊 펌프 대수제어 (PU1 기반):")
+        print("    - PU1 (M/E Load): 15~45%, 주기 180초")
+        print("    - < 30% (90초): SWP/FWP 각 1대")
+        print("    - ≥ 30% (90초): SWP/FWP 각 2대")
+        print()
+        print("  📊 주파수 제어:")
+        print("    - TX4 (FWP): 43~47°C, 주기 180초")
+        print("    - TX5 (SWP): 33~37°C, 주기 180초")
+        print()
+        print("[INFO] 알람 시나리오: 비활성화 (대수제어 집중 관찰)")
 
         while self.running:
             try:
-                # 알람 시나리오: 비활성화 (정상 운전 모드)
-                # self.alarm_scenario_counter += 1
+                # 시뮬레이션 틱 증가
+                self.simulation_tick += 1
 
-                # if self.alarm_scenario_counter >= 60 and not self.alarm_active:
-                #     # 알람 조건 시작
-                #     self.alarm_active = True
-                #     self.alarm_scenario_counter = 0
-                #     print("=" * 70)
-                #     print("[시뮬레이터] 🔔 알람 시나리오 시작 (15초간 유지)")
-                #     print("  - 🔴 주기관 부하 과다 (PU1: 60% → 90%, CRITICAL)")
-                #     print("  - 🔴 외부 공기 온도 상승 (TX7: 25°C → 42°C, CRITICAL)")
-                #     print("  - ⚠️ E/R 내부 온도 상승 (TX6: 40°C → 52°C, WARNING)")
-                #     print("  - ⚠️ SW 압력 저하 (DPX1: 3.5 → 1.3 kg/cm², WARNING)")
-                #     print("=" * 70)
+                # ========================================
+                # 알람 시나리오 관리 (90초마다 15초간 발생) ← 대수제어 테스트용 단축
+                # ========================================
+                self.alarm_scenario_counter += 1
 
-                # if self.alarm_active and self.alarm_scenario_counter >= 15:
-                #     # 알람 조건 해제
-                #     self.alarm_active = False
-                #     self.alarm_scenario_counter = 0
-                #     print("=" * 70)
-                #     print("[시뮬레이터] ✅ 알람 시나리오 종료 (정상 복귀)")
-                #     print("  알람은 165초 후 재발생")
-                #     print("  (현재 알람은 확인 전까지 유지됨)")
-                #     print("=" * 70)
+                # 알람 시작 조건: 90초 경과 후
+                if not self.alarm_active and self.alarm_scenario_counter >= 90:
+                    self.alarm_active = True
+                    self.alarm_duration = 0
+                    self.alarm_scenario_counter = 0
+                    print("=" * 70)
+                    print(f"[시뮬레이터] 🔔 알람 시나리오 시작 (15초간 유지) ⚡ 테스트 모드")
+                    print("  - 🔴 TX6 E/R 내부 온도 상승: 52°C (임계값 50°C 초과)")
+                    print("  - 🔴 TX7 외부 온도 상승: 42°C (임계값 40°C 초과)")
+                    print("  - 🔴 PX1 압력 저하: 1.3 bar (임계값 1.5 bar 미만)")
+                    print("  - 🔴 PU1 M/E 부하 과다: 90% (임계값 85% 초과)")
+                    print("=" * 70)
 
-                # === 물리 법칙 기반 온도 센서 시뮬레이션 ===
+                # 알람 종료 조건: 15초 경과 후
+                if self.alarm_active:
+                    self.alarm_duration += 1
+                    if self.alarm_duration >= 15:
+                        self.alarm_active = False
+                        self.alarm_duration = 0
+                        print("=" * 70)
+                        print(f"[시뮬레이터] ✅ 알람 시나리오 종료 (정상 복귀)")
+                        print("  다음 알람: 약 90초 후")
+                        print("=" * 70)
+
+                # ========================================
+                # 물리 법칙 기반 온도 센서 시뮬레이션
+                # ========================================
 
                 # TX1 (COOLER SW INLET): 바닷물 온도 (여름: 22-26°C)
                 tx1 = self.seawater_temp + random.uniform(-0.5, 0.5)
 
-                # TX7 (E/R OUTSIDE): 외기 온도 - 알람 시나리오 적용
+                # TX7 (E/R OUTSIDE): 외기 온도
                 if self.alarm_active:
-                    tx7 = 42.0 + random.uniform(-0.5, 0.5)  # CRITICAL 알람 조건 (HIGH: 40°C 이상)
+                    tx7 = 42.0 + random.uniform(-0.5, 0.5)  # 알람: 40°C 임계값 초과
                 else:
                     tx7 = self.ambient_temp + random.uniform(-1.0, 1.0)
 
                 # 현재 M/E 부하율에 따른 열부하 계산
-                heat_load_factor = self.me_load / 60.0  # 60%를 기준(1.0)으로 정규화
+                heat_load_factor = self.me_load / 60.0
 
-                # TX2 (NO.1 COOLER SW OUTLET): TX1보다 높고 49°C 이하
-                # 냉각수가 엔진을 냉각하면서 온도 상승 (부하에 비례)
-                delta_t_sw_no1 = 8.0 * heat_load_factor  # 기본 온도 상승: 8°C
+                # TX2 (NO.1 COOLER SW OUTLET): TX1 + 열부하
+                delta_t_sw_no1 = 8.0 * heat_load_factor
                 tx2 = min(tx1 + delta_t_sw_no1 + random.uniform(-0.5, 0.5), 48.5)
 
-                # TX3 (NO.2 COOLER SW OUTLET): TX1보다 높고 49°C 이하
-                # 2차 냉각기, NO.1보다 약간 낮을 수 있음
+                # TX3 (NO.2 COOLER SW OUTLET): TX1 + 열부하 (약간 낮음)
                 delta_t_sw_no2 = 6.0 * heat_load_factor
                 tx3 = min(tx1 + delta_t_sw_no2 + random.uniform(-0.5, 0.5), 48.5)
 
-                # TX5 (COOLER FW OUTLET): 목표 34-36°C (AI 제어 목표)
-                tx5 = 35.0 + random.uniform(-0.8, 0.8)  # 정상 범위 유지
+                # ========================================
+                # 핵심: 동적 사이클 온도 (AI 목표주파수 변동 유발)
+                # ========================================
 
-                # TX4 (COOLER FW INLET): TX5보다 높고 48°C 이하
-                # FW가 엔진을 냉각한 후 온도 (TX5보다 7-10°C 높음)
-                delta_t_fw = 8.0 + 3.0 * heat_load_factor
-                tx4 = min(tx5 + delta_t_fw + random.uniform(-0.5, 0.5), 47.5)
-
-                # TX6 (E/R INSIDE): 목표 35°C로 낮춤 (AI가 팬을 47Hz로 제어하도록)
+                # TX5 (COOLER FW OUTLET): SWP 제어용 - 32~38°C 사이클
+                # 목표 온도 35°C 기준, 상승 시 SWP 주파수 증가, 하강 시 감소
                 if self.alarm_active:
-                    tx6 = 52.0 + random.uniform(-0.5, 0.5)  # WARNING 알람 조건 (HIGH: 50°C 이상)
+                    tx5 = 42.0 + random.uniform(-0.5, 0.5)  # 알람: 높은 온도
                 else:
-                    # 기본 온도 35°C 사용
-                    tx6 = self.base_temps['TX6'] + random.uniform(-2.0, 2.0)
+                    tx5 = self.get_cyclic_temp('TX5') + random.uniform(-0.3, 0.3)
+
+                # TX4 (COOLER FW INLET): FWP 제어용 - 40~46°C 사이클
+                # 목표 온도 43°C 기준, 상승 시 FWP 주파수 증가
+                if self.alarm_active:
+                    tx4 = 48.0 + random.uniform(-0.5, 0.5)  # 알람: 높은 온도
+                else:
+                    tx4 = self.get_cyclic_temp('TX4') + random.uniform(-0.3, 0.3)
+
+                # TX6 (E/R INSIDE): FAN 제어용 - 32~44°C 사이클
+                # 목표 온도 38°C 기준, 상승 시 FAN 주파수 증가
+                if self.alarm_active:
+                    tx6 = 52.0 + random.uniform(-0.5, 0.5)  # 알람: 50°C 임계값 초과
+                else:
+                    tx6 = self.get_cyclic_temp('TX6') + random.uniform(-0.3, 0.3)
+
+                # base_temps 업데이트 (상태 출력용)
+                self.base_temps['TX4'] = tx4
+                self.base_temps['TX5'] = tx5
+                self.base_temps['TX6'] = tx6
 
                 # Holding Registers에 쓰기 (address 10~16)
                 self.store.setValues(3, 10, [
@@ -218,36 +316,35 @@ class ESSPLCSimulator:
                     self.temperature_to_raw(tx7)
                 ])
 
-                # === 압력 센서 (K400017~K400018) ===
-                # PX1 (SW DISCHARGE PRESS): 1.0~3.0 BAR - 펌프 운전 대수와 부하에 비례
+                # ========================================
+                # 압력 센서 (PX1)
+                # ========================================
                 if self.alarm_active:
-                    dpx1 = 1.3 + random.uniform(-0.05, 0.05)  # 알람 조건 (LOW: 1.5 bar 이하)
+                    px1 = 1.3 + random.uniform(-0.05, 0.05)  # 알람: 1.5 bar 임계값 미만
                 else:
-                    # 운전 중인 SW 펌프 대수 확인
                     swp_running_count = sum([
                         1 for p in ['SWP1', 'SWP2', 'SWP3']
                         if self.equipment[p]['running']
                     ])
-                    # 펌프 대수와 부하에 따라 압력 변동 (1대: 1.5 bar, 2대: 2.5 bar)
                     base_pressure = 1.0 + swp_running_count * 0.7
-                    dpx1 = base_pressure + 0.3 * (self.me_load / 60.0) + random.uniform(-0.1, 0.1)
-                    dpx1 = max(1.0, min(3.0, dpx1))  # 1.0~3.0 BAR 범위 제한
-
-                # DPX2 (E/R Diff Press): E/R 내외부 압력차 (Pa)
-                # 팬 운전 대수에 비례하여 양압 유지
-                dpx2 = self.base_pressure['DPX2'] + random.uniform(-2.0, 2.0)
+                    px1 = base_pressure + 0.3 * (self.me_load / 60.0) + random.uniform(-0.1, 0.1)
+                    px1 = max(1.0, min(3.0, px1))
 
                 self.store.setValues(3, 17, [
-                    self.pressure_kgcm2_to_raw(dpx1),
-                    self.pressure_pa_to_raw(dpx2)
+                    self.pressure_kgcm2_to_raw(px1)
                 ])
 
-                # M/E Load (K400019) - 알람 시나리오 적용
-                if self.alarm_active:
-                    self.me_load = 90.0 + random.uniform(-0.5, 0.5)  # CRITICAL 알람 조건 (HIGH: 85% 이상)
-                else:
-                    self.me_load += random.uniform(-0.8, 0.8)
-                    self.me_load = max(35, min(60, self.me_load))  # 정상 범위: 35~60% (60% 이하)
+                # ========================================
+                # M/E Load (PU1) - 사이클 기반 (펌프 대수제어 테스트)
+                # ========================================
+                import math
+                cycle = self.me_load_cycle
+                t = self.simulation_tick + cycle['phase']
+                sine_value = math.sin(2 * math.pi * t / cycle['period'])
+                mid = (cycle['max'] + cycle['min']) / 2
+                amplitude = (cycle['max'] - cycle['min']) / 2
+                self.me_load = mid + amplitude * sine_value
+
                 self.store.setValues(3, 19, [self.percentage_to_raw(self.me_load)])
 
                 # 장비 상태 업데이트
@@ -255,6 +352,9 @@ class ESSPLCSimulator:
 
                 # VFD 데이터 업데이트
                 self.update_vfd_data()
+
+                # 알람 체크
+                self.check_alarms()
 
                 time.sleep(1)  # 1초마다 업데이트
 
@@ -539,20 +639,143 @@ class ESSPLCSimulator:
         """주기적으로 시뮬레이터 상태 출력"""
         while self.running:
             try:
-                time.sleep(10)
-                print(f"\n[상태] {datetime.now().strftime('%H:%M:%S')}")
-                print(f"  운전 중: SWP1={self.equipment['SWP1']['running']}, "
+                time.sleep(15)
+                alarm_str = "🔴 알람 활성" if self.alarm_active else "✅ 정상"
+                print(f"\n[상태] {datetime.now().strftime('%H:%M:%S')} | {alarm_str}")
+                print(f"  장비: SWP1={self.equipment['SWP1']['running']}, "
                       f"SWP2={self.equipment['SWP2']['running']}, "
                       f"FWP1={self.equipment['FWP1']['running']}, "
                       f"FWP2={self.equipment['FWP2']['running']}, "
                       f"FAN1={self.equipment['FAN1']['running_fwd']}, "
                       f"FAN2={self.equipment['FAN2']['running_fwd']}")
-                print(f"  온도: TX1={self.base_temps['TX1']:.1f}°C, "
-                      f"TX6={self.base_temps['TX6']:.1f}°C")
-                print(f"  압력: DPX1={self.base_pressure['DPX1']:.2f} kg/cm², "
-                      f"DPX2={self.base_pressure['DPX2']:.1f} Pa")
+                print(f"  동적온도: TX4={self.base_temps.get('TX4', 0):.1f}°C (FWP), "
+                      f"TX5={self.base_temps.get('TX5', 0):.1f}°C (SWP), "
+                      f"TX6={self.base_temps.get('TX6', 0):.1f}°C (FAN)")
+                print(f"  주파수: SWP1={self.equipment['SWP1']['hz']:.1f}Hz, "
+                      f"FWP1={self.equipment['FWP1']['hz']:.1f}Hz, "
+                      f"FAN1={self.equipment['FAN1']['hz']:.1f}Hz")
+                print(f"  M/E부하: {self.me_load:.1f}% | 다음알람: {300 - self.alarm_scenario_counter}초 후")
             except Exception as e:
                 print(f"[ERROR] 상태 출력 오류: {e}")
+
+    def check_alarms(self):
+        """알람 체크 및 상태 업데이트"""
+
+        try:
+            # 임계값 읽기 (7000-7009)
+            thresholds = self.store.getValues(3, 7000, 10)
+
+            # 현재 센서값 읽기
+            sensor_temps = self.store.getValues(3, 10, 7)  # TX1-TX7
+            sensor_pressures = self.store.getValues(3, 17, 2)  # PX1, DPX2
+            sensor_load = self.store.getValues(3, 19, 1)  # PU1
+
+            alarm_bits_word0 = 0  # 온도 알람
+            alarm_bits_word1 = 0  # 압력/부하 알람
+            new_alarm_occurred = False
+
+            # TX1-TX7 온도 체크
+            for i in range(7):
+                sensor_raw = sensor_temps[i]
+                threshold_raw = thresholds[i]
+
+                if sensor_raw > threshold_raw:  # 상한 초과
+                    alarm_bits_word0 |= (1 << i)
+                    self.add_recent_alarm(i+1, 1, sensor_raw, threshold_raw)
+                    new_alarm_occurred = True
+
+            # PX1 압력 체크 (DPX1을 bar로 변환)
+            px1_raw = sensor_pressures[0]
+            px1_bar = px1_raw / 4608.0  # raw → bar 변환
+            px1_low_threshold = thresholds[7] / 100.0  # × 100 → bar
+            px1_high_threshold = thresholds[8] / 100.0
+
+            if px1_bar < px1_low_threshold:  # 하한 미만
+                alarm_bits_word1 |= (1 << 0)
+                self.add_recent_alarm(10, 2, int(px1_bar * 100), thresholds[7])
+                new_alarm_occurred = True
+
+            if px1_bar > px1_high_threshold:  # 상한 초과
+                alarm_bits_word1 |= (1 << 1)
+                self.add_recent_alarm(10, 1, int(px1_bar * 100), thresholds[8])
+                new_alarm_occurred = True
+
+            # PU1 부하 체크
+            pu1_raw = sensor_load[0]
+            pu1_percent = pu1_raw / 276.48  # raw → % 변환
+            pu1_high_threshold = thresholds[9] / 10.0  # × 10 → %
+
+            if pu1_percent > pu1_high_threshold:  # 상한 초과
+                alarm_bits_word1 |= (1 << 2)
+                self.add_recent_alarm(11, 1, int(pu1_percent * 10), thresholds[9])
+                new_alarm_occurred = True
+
+            # 알람 상태 레지스터 업데이트 (7100-7103)
+            unack_count = len([a for a in self.recent_alarms if a['status'] == 0])
+            new_alarm_flag = 1 if new_alarm_occurred else 0
+
+            self.store.setValues(3, 7100, [alarm_bits_word0, alarm_bits_word1, unack_count, new_alarm_flag])
+
+        except Exception as e:
+            print(f"[ERROR] 알람 체크 오류: {e}")
+
+    def add_recent_alarm(self, alarm_code, alarm_type, actual_value, threshold_value):
+        """최근 알람에 추가 (10개 순환 버퍼)"""
+
+        # 중복 체크
+        for alarm in self.recent_alarms:
+            if alarm['code'] == alarm_code and alarm['type'] == alarm_type and alarm['status'] == 0:
+                return  # 이미 미확인 상태로 존재
+
+        import time
+        timestamp = int(time.time())
+
+        alarm = {
+            'code': alarm_code,
+            'type': alarm_type,
+            'actual': actual_value,
+            'threshold': threshold_value,
+            'timestamp': timestamp,
+            'status': 0  # 0=미확인, 1=확인됨
+        }
+
+        # 순환 버퍼에 추가
+        if len(self.recent_alarms) >= 10:
+            self.recent_alarms.pop(0)  # 가장 오래된 것 제거
+        self.recent_alarms.append(alarm)
+
+        # PLC 레지스터에 쓰기
+        self.write_recent_alarms_to_registers()
+
+        sensor_names = {1: 'TX1', 2: 'TX2', 3: 'TX3', 4: 'TX4', 5: 'TX5', 6: 'TX6', 7: 'TX7', 10: 'PX1', 11: 'PU1'}
+        sensor_name = sensor_names.get(alarm_code, f'CODE_{alarm_code}')
+        alarm_type_str = '상한' if alarm_type == 1 else '하한'
+
+        print(f"[PLC 알람] {sensor_name} {alarm_type_str} 초과!")
+
+    def write_recent_alarms_to_registers(self):
+        """최근 알람을 레지스터 7200-7279에 쓰기"""
+
+        for i, alarm in enumerate(self.recent_alarms):
+            if i >= 10:
+                break
+
+            start_addr = 7200 + (i * 8)
+            timestamp_high = (alarm['timestamp'] >> 16) & 0xFFFF
+            timestamp_low = alarm['timestamp'] & 0xFFFF
+
+            alarm_data = [
+                alarm['code'],
+                alarm['type'],
+                alarm['actual'],
+                alarm['threshold'],
+                timestamp_high,
+                timestamp_low,
+                alarm['status'],
+                0  # 예약
+            ]
+
+            self.store.setValues(3, start_addr, alarm_data)
 
     def start(self):
         """시뮬레이터 시작"""

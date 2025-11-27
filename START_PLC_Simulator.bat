@@ -14,8 +14,8 @@ if not exist venv (
     echo [설치] Python 가상환경 생성 중...
     python -m venv venv
     if errorlevel 1 (
-        echo [ERROR] Python 가상환경 생성 실패
-        echo [INFO] Python 3.8 이상이 설치되어 있는지 확인하세요
+        echo ERROR: Python 가상환경 생성 실패
+        echo INFO: Python 3.8 이상이 설치되어 있는지 확인하세요
         pause
         exit /b 1
     )
@@ -23,16 +23,16 @@ if not exist venv (
     echo [설치] 의존성 패키지 설치 중...
     venv\Scripts\pip install -r requirements.txt
     if errorlevel 1 (
-        echo [ERROR] 패키지 설치 실패
+        echo ERROR: 패키지 설치 실패
         pause
         exit /b 1
     )
 )
 
 echo.
-echo [실행] PLC Simulator 시작...
-echo [INFO] Edge AI와 HMI가 192.168.1.10:502로 연결합니다
-echo [INFO] 종료: Ctrl+C
+echo ========================================
+echo   PLC Simulator Starting...
+echo ========================================
 echo.
 
 venv\Scripts\python.exe plc_simulator.py
