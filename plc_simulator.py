@@ -12,28 +12,19 @@ import random
 import threading
 from datetime import datetime
 
-# Windows 콘솔 인코딩 문제 해결
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# Windows 콘솔 인코딩 - Python 3.13에서는 기본 지원
+# sys.stdout/stderr 래핑 제거 (호환성 문제)
 
 try:
+    # pymodbus 2.5.3
     from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
     from pymodbus.datastore import ModbusSequentialDataBlock
     from pymodbus.server.sync import StartTcpServer
     from pymodbus.device import ModbusDeviceIdentification
 except ImportError as e:
     print(f"ERROR: pymodbus library import failed: {e}")
-    print("Trying alternative import...")
-    try:
-        from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
-        from pymodbus.datastore import ModbusSequentialDataBlock
-        from pymodbus.server import StartTcpServer
-        from pymodbus.device import ModbusDeviceIdentification
-    except ImportError:
-        print("ERROR: pymodbus library is required.")
-        print("Install: pip install pymodbus")
-        sys.exit(1)
+    print("Install: pip install pymodbus==2.5.3")
+    sys.exit(1)
 
 
 class ESSPLCSimulator:
@@ -162,6 +153,8 @@ class ESSPLCSimulator:
         print("[INFO] Node ID: 3")
         print("[INFO] Edge AI 결과 레지스터: 5000-5399 (Ready)")
         print("[INFO] 알람 시스템 레지스터: 7000-7279 (Ready)")
+        print("[INFO] 장비 상태 레지스터: 4000-4001 (Ready)")
+        print("[INFO] VFD 데이터 레지스터: 160-239 (Ready)")
         print("-" * 70)
 
     def temperature_to_raw(self, temp_celsius):

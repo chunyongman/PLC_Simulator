@@ -35,7 +35,7 @@ echo   PLC Simulator Starting...
 echo ========================================
 echo.
 
-venv\Scripts\python.exe plc_simulator.py
+venv\Scripts\python.exe -u plc_simulator.py
 
 echo.
 echo ========================================
