@@ -59,13 +59,13 @@ HMI 장비: 192.168.1.20 (PLC에서 읽기만)
 | 주소 | 항목 | 설명 | 포맷 |
 |------|------|------|------|
 | 10 | TX1 | CSW PP Disc Temp | °C × 10 |
-| 11 | TX2 | CSW PP Suc Temp | °C × 10 |
-| 12 | TX3 | FW CLNG In Temp | °C × 10 |
-| 13 | TX4 | FW CLNG Out Temp | °C × 10 |
-| 14 | TX5 | ESS Batt Temp | °C × 10 |
+| 11 | TX2 | No.1 CLR SW Out Temp | °C × 10 |
+| 12 | TX3 | No.2 CLR SW Out Temp | °C × 10 |
+| 13 | TX4 | CLR FW In Temp | °C × 10 |
+| 14 | TX5 | CLR FW Out Temp | °C × 10 |
 | 15 | TX6 | E/R Inside Temp | °C × 10 |
 | 16 | TX7 | E/R Outside Temp | °C × 10 |
-| 17 | DPX1 | CSW PP Disc Press | kg/cm² × 4608 |
+| 17 | PX1 | CSW PP Disc Press | kg/cm² × 4608 |
 | 18 | DPX2 | E/R Diff Press | Pa × 10 |
 | 19 | PU1 | M/E Load | % × 276.48 |
 
