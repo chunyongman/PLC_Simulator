@@ -55,6 +55,63 @@ class ESSPLCSimulator:
         self.current_alarm_sensors = []  # 현재 알람 발생 센서 (랜덤 2개)
         self.alarm_cycle_number = 0  # 알람 주기 번호 (랜덤 시드용)
 
+        # ===== VFD 이상 시나리오 (예방진단 테스트용) =====
+        self.vfd_anomaly_enabled = True  # VFD 이상 시나리오 활성화
+        self.vfd_anomaly_counter = 0  # VFD 이상 시나리오 카운터
+        self.vfd_anomaly_active = False  # VFD 이상 발생 중
+        self.vfd_anomaly_duration = 0  # VFD 이상 지속 시간
+        self.current_vfd_anomalies = []  # 현재 이상 발생 중인 VFD
+        self.vfd_anomaly_cycle_number = 0  # VFD 이상 주기 번호
+
+        # VFD 이상 유형 정의 (Edge Computer 임계값 기준으로 조정)
+        # Edge 임계값: motor_thermal 80/90/100, heatsink_temp 60/70/80, inverter_thermal 80/90/100
+        # 종합 점수: 0-2=정상, 3-5=주의, 6-8=경고, 9+=위험
+        self.vfd_anomaly_types = {
+            'motor_overheat': {
+                'name': '모터 과열',
+                'motor_thermal': (95, 110),   # 경고~위험 수준 (임계값 90/100 초과)
+                'heatsink_temp': (72, 85),    # 경고 수준 (임계값 70/80)
+                'inverter_thermal': (85, 95), # 주의~경고 수준
+                'severity': 2  # 경고
+            },
+            'inverter_overheat': {
+                'name': '인버터 과열',
+                'inverter_thermal': (95, 115), # 경고~위험 수준
+                'heatsink_temp': (75, 88),     # 경고~위험 수준
+                'motor_thermal': (82, 92),     # 주의~경고 수준
+                'severity': 2
+            },
+            'current_imbalance': {
+                'name': '3상 전류 불균형',
+                'phase_imbalance': (18, 35),  # 경고~위험 수준 (임계값 10/15/20)
+                'motor_thermal': (83, 93),    # 주의~경고 동반
+                'heatsink_temp': (62, 72),    # 주의~경고 동반
+                'severity': 2
+            },
+            'overcurrent': {
+                'name': '과전류',
+                'current_ratio': (1.15, 1.35), # 정격 대비 115-135% (임계값 90/100/110)
+                'motor_thermal': (98, 115),    # 경고~위험 수준
+                'heatsink_temp': (74, 86),     # 경고~위험 동반
+                'inverter_thermal': (88, 100), # 주의~경고 동반
+                'severity': 3  # 위험
+            },
+            'high_load': {
+                'name': '고부하 운전',
+                'torque': (140, 180),         # 고토크
+                'motor_thermal': (85, 98),    # 주의~경고 수준
+                'heatsink_temp': (65, 75),    # 주의~경고 동반
+                'severity': 1  # 주의
+            },
+            'dc_voltage_abnormal': {
+                'name': 'DC 링크 전압 이상',
+                'dc_link_voltage': (480, 520), # 저전압
+                'motor_thermal': (82, 92),     # 동반 증상
+                'inverter_thermal': (83, 93),  # 동반 증상
+                'severity': 2
+            }
+        }
+
         # 알람 가능 센서 목록 및 알람값 정의
         self.alarm_sensors = {
             'TX1': {'name': '냉각수 토출 온도 상승', 'alarm_value': 32.0, 'threshold': 30.0, 'unit': '°C'},
@@ -179,7 +236,11 @@ class ESSPLCSimulator:
         print("[INFO] Edge AI 결과 레지스터: 5000-5523 (Ready)")
         print("[INFO] 알람 시스템 레지스터: 7000-7279 (Ready)")
         print("[INFO] 장비 상태 레지스터: 4000-4001 (Ready)")
-        print("[INFO] VFD 데이터 레지스터: 160-239 (Ready)")
+        print("[INFO] VFD 데이터 레지스터: 160-359 (20 regs × 10 equip, 예방진단 포함)")
+        print("-" * 70)
+        print("[VFD 이상 시나리오] 활성화됨 (60초 정상 → 60초 이상)")
+        print("  - 이상 유형: 모터 과열, 인버터 과열, 3상 전류 불균형,")
+        print("              과전류, 고부하 운전, DC 링크 전압 이상")
         print("-" * 70)
 
     def temperature_to_raw(self, temp_celsius):
@@ -218,9 +279,14 @@ class ESSPLCSimulator:
         print("[시작] 센서 데이터 시뮬레이션 스레드")
         print("[INFO] Random alarm system activated:")
         print()
-        print("  [ALARM] Alarm scenario:")
+        print("  [ALARM] Sensor alarm scenario:")
         print("    - 90s normal -> 15s alarm (random 2 sensors)")
         print("    - Target: TX1~TX7, PX1, PU1 (2 of 9)")
+        print()
+        print("  [VFD] VFD anomaly scenario (for preventive diagnosis):")
+        print("    - 60s normal -> 60s anomaly (random 1-2 VFDs)")
+        print("    - Types: motor_overheat, inverter_overheat, current_imbalance,")
+        print("             overcurrent, high_load, dc_voltage_abnormal")
         print()
         print("  [TEMP] Dynamic temperature control:")
         print("    - TX4 (FWP): 43~47C, period 180s")
@@ -268,6 +334,60 @@ class ESSPLCSimulator:
                         print(f"[SIM] ALARM scenario ended (back to normal)")
                         print("  Next alarm: ~90s later (random 2 sensors)")
                         print("=" * 70)
+
+                # ========================================
+                # VFD 이상 시나리오 관리 (60초 정상 -> 30초 이상)
+                # ========================================
+                if self.vfd_anomaly_enabled:
+                    self.vfd_anomaly_counter += 1
+
+                    # VFD 이상 시작 조건: 60초 경과 후
+                    if not self.vfd_anomaly_active and self.vfd_anomaly_counter >= 60:
+                        self.vfd_anomaly_active = True
+                        self.vfd_anomaly_duration = 0
+                        self.vfd_anomaly_counter = 0
+                        self.vfd_anomaly_cycle_number += 1
+
+                        # 랜덤하게 1-2개 VFD 선택 (운전 중인 것만)
+                        running_vfds = [
+                            name for name, eq in self.equipment.items()
+                            if eq.get('running', False) or eq.get('running_fwd', False)
+                        ]
+                        if running_vfds:
+                            random.seed(self.vfd_anomaly_cycle_number + 1000)
+                            num_anomalies = random.randint(1, min(2, len(running_vfds)))
+                            selected_vfds = random.sample(running_vfds, num_anomalies)
+
+                            # 각 VFD에 랜덤 이상 유형 할당
+                            anomaly_types = list(self.vfd_anomaly_types.keys())
+                            self.current_vfd_anomalies = []
+                            for vfd in selected_vfds:
+                                anomaly_type = random.choice(anomaly_types)
+                                self.current_vfd_anomalies.append({
+                                    'vfd': vfd,
+                                    'type': anomaly_type,
+                                    'info': self.vfd_anomaly_types[anomaly_type]
+                                })
+
+                            print("=" * 70)
+                            print(f"[VFD] ANOMALY triggered (30s) - cycle #{self.vfd_anomaly_cycle_number}")
+                            for anomaly in self.current_vfd_anomalies:
+                                severity_names = {1: '주의', 2: '경고', 3: '위험'}
+                                severity = anomaly['info']['severity']
+                                print(f"  - [!] {anomaly['vfd']}: {anomaly['info']['name']} (Severity: {severity_names[severity]})")
+                            print("=" * 70)
+
+                    # VFD 이상 종료 조건: 60초 경과 후 (확인할 시간 확보)
+                    if self.vfd_anomaly_active:
+                        self.vfd_anomaly_duration += 1
+                        if self.vfd_anomaly_duration >= 60:
+                            self.vfd_anomaly_active = False
+                            self.vfd_anomaly_duration = 0
+                            self.current_vfd_anomalies = []
+                            print("=" * 70)
+                            print(f"[VFD] ANOMALY scenario ended (back to normal)")
+                            print("  Next VFD anomaly: ~60s later (random 1-2 VFDs)")
+                            print("=" * 70)
 
                 # ========================================
                 # 물리 법칙 기반 온도 센서 시뮬레이션 (랜덤 알람 적용)
@@ -436,37 +556,35 @@ class ESSPLCSimulator:
         self.store.setValues(3, 4000, [word_4000, word_4001])
 
     def update_vfd_data(self):
-        """VFD 운전 데이터 업데이트 (K400160~K400238)"""
+        """VFD 운전 데이터 업데이트 (확장: 장비당 20개 레지스터, 160~359)"""
 
-        # SWP1~3, FWP1~3, FAN1~4 각 8개 레지스터
+        # SWP1~3, FWP1~3, FAN1~4 각 20개 레지스터
         vfd_configs = [
-            ('SWP1', 160), ('SWP2', 168), ('SWP3', 176),
-            ('FWP1', 184), ('FWP2', 192), ('FWP3', 200),
-            ('FAN1', 208), ('FAN2', 216), ('FAN3', 224), ('FAN4', 232)
+            ('SWP1', 160), ('SWP2', 180), ('SWP3', 200),
+            ('FWP1', 220), ('FWP2', 240), ('FWP3', 260),
+            ('FAN1', 280), ('FAN2', 300), ('FAN3', 320), ('FAN4', 340)
         ]
+
+        # 장비별 정격 전류 (A)
+        rated_currents = {
+            'SWP1': 300, 'SWP2': 300, 'SWP3': 300,
+            'FWP1': 370, 'FWP2': 370, 'FWP3': 370,
+            'FAN1': 70, 'FAN2': 70, 'FAN3': 70, 'FAN4': 70
+        }
 
         for i, (eq_name, start_addr) in enumerate(vfd_configs):
             eq = self.equipment[eq_name]
             running = eq.get('running', False) or eq.get('running_fwd', False) or eq.get('running_bwd', False)
-
-            # ================================================================
-            # 1단계: PLC가 Edge AI 목표 주파수를 VFD에 전송 (명령)
-            # ================================================================
-            vfd_command_freq = eq['hz']  # 현재 VFD 명령 주파수
-
-            # AUTO 모드이고 VFD 모드일 때만 Edge AI 주파수 사용
+            vfd_command_freq = eq['hz']
             auto_mode = eq.get('auto_mode', True)
             vfd_mode = eq.get('vfd_mode', True)
 
             if auto_mode and vfd_mode and running:
-                # Edge AI 목표 주파수 읽기 (레지스터 5000-5009)
                 try:
                     ai_freq_raw = self.store.getValues(3, 5000 + i, 1)[0]
-                    if ai_freq_raw > 0:  # AI 주파수가 설정되어 있으면
+                    if ai_freq_raw > 0:
                         ai_freq_hz = ai_freq_raw / 10.0
-                        # AI 목표 주파수로 서서히 변경 (급격한 변화 방지)
                         if abs(ai_freq_hz - vfd_command_freq) > 0.5:
-                            # 0.5Hz씩 서서히 변경
                             if ai_freq_hz > vfd_command_freq:
                                 vfd_command_freq = min(vfd_command_freq + 0.5, ai_freq_hz, 60.0)
                             else:
@@ -474,72 +592,144 @@ class ESSPLCSimulator:
                         else:
                             vfd_command_freq = ai_freq_hz
                 except:
-                    pass  # AI 주파수 읽기 실패 시 현재 주파수 유지
+                    pass
 
-            # ================================================================
-            # 2단계: VFD 시뮬레이션 - 명령을 받아 실제 모터 제어 후 피드백
-            # ================================================================
-            # 실제 환경: VFD가 PLC 명령을 받아 모터 제어 → 실제 주파수를 PLC로 피드백
-            # 시뮬레이터: 명령값에 약간의 오차 추가 (±0.3Hz, 실제 측정 오차 반영)
             if running:
                 vfd_actual_freq = vfd_command_freq + random.uniform(-0.3, 0.3)
-                vfd_actual_freq = max(0.0, min(60.0, vfd_actual_freq))  # 0-60Hz 범위
+                vfd_actual_freq = max(0.0, min(60.0, vfd_actual_freq))
             else:
                 vfd_actual_freq = 0.0
 
-            # 명령 주파수를 내부 상태에 저장 (다음 cycle 명령 생성 시 기준)
             eq['hz'] = vfd_command_freq
 
-            # ================================================================
-            # 3단계: VFD 피드백을 PLC 레지스터 160-239에 저장 (HMI 표시용)
-            # ================================================================
-            # Frequency (Hz * 10) - VFD가 피드백한 실제 주파수
+            # === VFD 데이터 (20개 레지스터) ===
             frequency = self.hz_to_raw(vfd_actual_freq)
-
-            # Power (kW) - Edge Computer가 계산한 실제 전력 읽기 (레지스터 5620-5629)
-            # Edge Computer에서 큐빅 법칙으로 계산: P = P_rated × (f/60)³
             try:
                 power_raw = self.store.getValues(3, 5620 + i, 1)[0]
-                power = power_raw // 10  # kW × 10 → kW
+                power = power_raw // 10
             except:
                 power = 0
+            avg_power = power
+            rated_current = rated_currents[eq_name]
 
-            # Edge AI가 계산한 절감량 읽기 (레지스터 5100-5109)
-            try:
-                savings_kw_raw = self.store.getValues(3, 5100 + i, 1)[0]
-                savings_kw = savings_kw_raw / 10.0  # kW × 10 → kW
-                # kW를 kWh로 변환 (1초마다 업데이트이므로 / 3600)
-                savings = int(savings_kw * 1000)  # 임시로 kW를 정수로 저장
-            except:
-                savings = 0
+            # 예방진단 데이터 시뮬레이션
+            # VFD 이상 시나리오 확인
+            current_anomaly = None
+            if self.vfd_anomaly_active:
+                for anomaly in self.current_vfd_anomalies:
+                    if anomaly['vfd'] == eq_name:
+                        current_anomaly = anomaly
+                        break
 
-            # 큐빅 법칙으로 절감률 계산 (Edge Computer 대시보드와 동일)
-            # P = P_rated × (f/60)³ → 절감률 = (1 - (f/60)³) × 100
-            if running and vfd_actual_freq > 0:
-                savings_ratio = (1 - (vfd_actual_freq / 60) ** 3) * 100
-                savings_ratio = max(0, min(100, savings_ratio))  # 0-100% 범위
-            else:
-                savings_ratio = 0
-
-            # Run Hours - 실제 운전 시간 (누적)
-            current_hours = self.store.getValues(3, start_addr + 6, 1)[0]
             if running:
-                run_hours = current_hours + 1  # 1초마다 1씩 증가
+                # 기본 정상 값
+                motor_current = int(rated_current * random.uniform(0.70, 0.85) * 10)
+                motor_thermal = random.randint(50, 75)
+                heatsink_temp = random.randint(40, 55)
+                torque = int(vfd_actual_freq * 2 + random.uniform(-5, 5))
+                inverter_thermal = random.randint(45, 70)
+                system_temp = random.randint(35, 50)
+                base_phase = motor_current / 10 / 1.732
+                phase_u = int((base_phase + random.uniform(-2, 2)) * 10)
+                phase_v = int((base_phase + random.uniform(-2, 2)) * 10)
+                phase_w = int((base_phase + random.uniform(-2, 2)) * 10)
+                dc_link_voltage = random.randint(540, 560)
+
+                # ===== VFD 이상 시나리오 적용 =====
+                if current_anomaly:
+                    anomaly_type = current_anomaly['type']
+                    anomaly_info = current_anomaly['info']
+
+                    if anomaly_type == 'motor_overheat':
+                        # 모터 과열: motor_thermal, heatsink_temp, inverter_thermal 모두 상승
+                        motor_thermal = random.randint(*anomaly_info['motor_thermal'])
+                        heatsink_temp = random.randint(*anomaly_info['heatsink_temp'])
+                        inverter_thermal = random.randint(*anomaly_info['inverter_thermal'])
+                        system_temp = random.randint(55, 70)
+
+                    elif anomaly_type == 'inverter_overheat':
+                        # 인버터 과열: inverter_thermal, heatsink_temp, motor_thermal 모두 상승
+                        inverter_thermal = random.randint(*anomaly_info['inverter_thermal'])
+                        heatsink_temp = random.randint(*anomaly_info['heatsink_temp'])
+                        motor_thermal = random.randint(*anomaly_info['motor_thermal'])
+                        system_temp = random.randint(58, 72)
+
+                    elif anomaly_type == 'current_imbalance':
+                        # 3상 전류 불균형 + motor_thermal, heatsink_temp 동반 상승
+                        imbalance_pct = random.uniform(*anomaly_info['phase_imbalance']) / 100
+                        base_phase = motor_current / 10 / 1.732
+                        phase_u = int((base_phase * (1 + imbalance_pct)) * 10)
+                        phase_v = int((base_phase * (1 - imbalance_pct * 0.5)) * 10)
+                        phase_w = int((base_phase * (1 - imbalance_pct * 0.5)) * 10)
+                        motor_thermal = random.randint(*anomaly_info['motor_thermal'])
+                        heatsink_temp = random.randint(*anomaly_info['heatsink_temp'])
+
+                    elif anomaly_type == 'overcurrent':
+                        # 과전류: motor_current, motor_thermal, heatsink_temp, inverter_thermal 모두 상승
+                        current_ratio = random.uniform(*anomaly_info['current_ratio'])
+                        motor_current = int(rated_current * current_ratio * 10)
+                        motor_thermal = random.randint(*anomaly_info['motor_thermal'])
+                        heatsink_temp = random.randint(*anomaly_info['heatsink_temp'])
+                        inverter_thermal = random.randint(*anomaly_info['inverter_thermal'])
+                        # 3상 전류도 상승
+                        base_phase = motor_current / 10 / 1.732
+                        phase_u = int((base_phase + random.uniform(-3, 3)) * 10)
+                        phase_v = int((base_phase + random.uniform(-3, 3)) * 10)
+                        phase_w = int((base_phase + random.uniform(-3, 3)) * 10)
+                        system_temp = random.randint(60, 75)
+
+                    elif anomaly_type == 'high_load':
+                        # 고부하 운전: torque, motor_thermal, heatsink_temp 상승
+                        torque = random.randint(*anomaly_info['torque'])
+                        motor_thermal = random.randint(*anomaly_info['motor_thermal'])
+                        heatsink_temp = random.randint(*anomaly_info['heatsink_temp'])
+
+                    elif anomaly_type == 'dc_voltage_abnormal':
+                        # DC 링크 전압 이상 + motor_thermal, inverter_thermal 동반 상승
+                        dc_link_voltage = random.randint(*anomaly_info['dc_link_voltage'])
+                        motor_thermal = random.randint(*anomaly_info['motor_thermal'])
+                        inverter_thermal = random.randint(*anomaly_info['inverter_thermal'])
+
             else:
-                run_hours = current_hours
+                motor_current = 0
+                motor_thermal = 0
+                heatsink_temp = 25
+                torque = 0
+                inverter_thermal = 0
+                system_temp = 25
+                phase_u = phase_v = phase_w = 0
+                dc_link_voltage = 0
 
-            # Data: [Frequency, Power, AvgPower, Savings_L, Savings_H, Ratio, Hours_L, Hours_H]
+            # 누적 데이터
+            try:
+                kwh_lo = self.store.getValues(3, start_addr + 9, 1)[0]
+                kwh_hi = self.store.getValues(3, start_addr + 10, 1)[0]
+                kwh_counter = (kwh_hi << 16) | kwh_lo
+                hours_lo = self.store.getValues(3, start_addr + 18, 1)[0]
+                hours_hi = self.store.getValues(3, start_addr + 19, 1)[0]
+                run_hours = (hours_hi << 16) | hours_lo
+            except:
+                kwh_counter = 0
+                run_hours = 0
+            if running:
+                kwh_counter += 1
+                run_hours += 1
+
+            try:
+                num_starts = self.store.getValues(3, start_addr + 11, 1)[0]
+                if num_starts == 0:
+                    num_starts = random.randint(100, 500)
+            except:
+                num_starts = random.randint(100, 500)
+
+            # 20개 레지스터 데이터
             vfd_data = [
-                frequency,              # Hz * 10 (Edge AI 목표 주파수 반영됨)
-                power,                  # kW
-                power,                  # Avg kW
-                savings & 0xFFFF,       # Savings Low Word (Edge AI 값)
-                (savings >> 16) & 0xFFFF,  # Savings High Word (Edge AI 값)
-                int(savings_ratio),     # Savings Ratio % (Edge AI 값)
-                run_hours & 0xFFFF,     # Run Hours Low
-                (run_hours >> 16) & 0xFFFF  # Run Hours High
+                frequency, power, avg_power, motor_current, motor_thermal,
+                heatsink_temp, torque, inverter_thermal, system_temp,
+                kwh_counter & 0xFFFF, (kwh_counter >> 16) & 0xFFFF,
+                num_starts, 0, phase_u, phase_v, phase_w, 0, dc_link_voltage,
+                run_hours & 0xFFFF, (run_hours >> 16) & 0xFFFF
             ]
-
             self.store.setValues(3, start_addr, vfd_data)
 
         # AUTO/MANUAL, VFD/BYPASS 코일 업데이트
@@ -669,7 +859,8 @@ class ESSPLCSimulator:
             try:
                 time.sleep(15)
                 alarm_str = "[!] ALARM ACTIVE" if self.alarm_active else "[OK] Normal"
-                print(f"\n[상태] {datetime.now().strftime('%H:%M:%S')} | {alarm_str}")
+                vfd_str = "[!] VFD ANOMALY" if self.vfd_anomaly_active else "[OK] VFD Normal"
+                print(f"\n[상태] {datetime.now().strftime('%H:%M:%S')} | {alarm_str} | {vfd_str}")
                 print(f"  장비: SWP1={self.equipment['SWP1']['running']}, "
                       f"SWP2={self.equipment['SWP2']['running']}, "
                       f"FWP1={self.equipment['FWP1']['running']}, "
@@ -682,7 +873,15 @@ class ESSPLCSimulator:
                 print(f"  주파수: SWP1={self.equipment['SWP1']['hz']:.1f}Hz, "
                       f"FWP1={self.equipment['FWP1']['hz']:.1f}Hz, "
                       f"FAN1={self.equipment['FAN1']['hz']:.1f}Hz")
-                print(f"  M/E부하: {self.me_load:.1f}% | 다음알람: {300 - self.alarm_scenario_counter}초 후")
+                print(f"  M/E부하: {self.me_load:.1f}% | 다음알람: {90 - self.alarm_scenario_counter}초 후")
+
+                # VFD 이상 상태 출력
+                if self.vfd_anomaly_enabled:
+                    if self.vfd_anomaly_active:
+                        anomaly_names = [f"{a['vfd']}({a['info']['name']})" for a in self.current_vfd_anomalies]
+                        print(f"  [VFD 이상] {', '.join(anomaly_names)} | 남은시간: {60 - self.vfd_anomaly_duration}초")
+                    else:
+                        print(f"  [VFD 정상] 다음 이상 발생: {60 - self.vfd_anomaly_counter}초 후")
             except Exception as e:
                 print(f"[ERROR] 상태 출력 오류: {e}")
 
