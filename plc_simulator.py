@@ -496,10 +496,12 @@ class ESSPLCSimulator:
             # Frequency (Hz * 10) - VFD가 피드백한 실제 주파수
             frequency = self.hz_to_raw(vfd_actual_freq)
 
-            # Power (kW) - VFD 실제 주파수 기반 전력
-            if running:
-                power = int(vfd_actual_freq * 0.8 + random.uniform(0, 5))
-            else:
+            # Power (kW) - Edge Computer가 계산한 실제 전력 읽기 (레지스터 5620-5629)
+            # Edge Computer에서 큐빅 법칙으로 계산: P = P_rated × (f/60)³
+            try:
+                power_raw = self.store.getValues(3, 5620 + i, 1)[0]
+                power = power_raw // 10  # kW × 10 → kW
+            except:
                 power = 0
 
             # Edge AI가 계산한 절감량 읽기 (레지스터 5100-5109)
@@ -511,16 +513,12 @@ class ESSPLCSimulator:
             except:
                 savings = 0
 
-            # Edge AI가 계산한 절감률 읽기 (레지스터 5300-5303)
-            try:
-                if i < 3:  # SWP
-                    savings_ratio_raw = self.store.getValues(3, 5301, 1)[0]
-                elif i < 6:  # FWP
-                    savings_ratio_raw = self.store.getValues(3, 5302, 1)[0]
-                else:  # FAN
-                    savings_ratio_raw = self.store.getValues(3, 5303, 1)[0]
-                savings_ratio = savings_ratio_raw / 10  # % × 10 → %
-            except:
+            # 큐빅 법칙으로 절감률 계산 (Edge Computer 대시보드와 동일)
+            # P = P_rated × (f/60)³ → 절감률 = (1 - (f/60)³) × 100
+            if running and vfd_actual_freq > 0:
+                savings_ratio = (1 - (vfd_actual_freq / 60) ** 3) * 100
+                savings_ratio = max(0, min(100, savings_ratio))  # 0-100% 범위
+            else:
                 savings_ratio = 0
 
             # Run Hours - 실제 운전 시간 (누적)
