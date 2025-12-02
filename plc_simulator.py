@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ESS HMI PLC 시뮬레이터
-Engine Room Ventilation System PLC를 시뮬레이션합니다.
+ESS PLC 시뮬레이터
+냉각수 시스템과 E/R 환기 시스템의 PLC를 시뮬레이션합니다.
 """
 
 import sys
@@ -29,12 +29,12 @@ except ImportError as e:
 
 
 class ESSPLCSimulator:
-    """ESS (Engine Room Ventilation) PLC 시뮬레이터"""
+    """ESS PLC 시뮬레이터 - 냉각수 시스템 및 E/R 환기 시스템"""
 
     def __init__(self):
         print("=" * 70)
-        print("  ESS HMI PLC 시뮬레이터")
-        print("  Engine Room Ventilation System")
+        print("  ESS PLC 시뮬레이터")
+        print("  냉각수 시스템 및 E/R 환기 시스템")
         print("=" * 70)
 
         # Modbus 데이터 스토어 초기화 (65535개 레지스터/코일)
