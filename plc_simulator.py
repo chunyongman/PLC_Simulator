@@ -204,6 +204,26 @@ class ESSPLCSimulator:
         self.store.setValues(3, 5510, [0] * 4)   # VFD 가변 전력
         self.store.setValues(3, 5520, [0] * 4)   # 절감 전력
 
+        # ESS 운전 데이터 레지스터 초기화 (Edge Computer가 쓰기)
+        # 5700-5759: 개별 장비 누적 데이터
+        self.store.setValues(3, 5700, [0] * 10)  # ESS 운전시간 (hours × 10)
+        self.store.setValues(3, 5710, [0] * 10)  # 총 운전시간 (hours × 10)
+        self.store.setValues(3, 5720, [0] * 10)  # ESS 모드 소비 전력량 (kWh × 10)
+        self.store.setValues(3, 5730, [0] * 10)  # 60Hz 기준 전력량 (kWh × 10)
+        self.store.setValues(3, 5740, [0] * 10)  # 절감 전력량 (kWh × 10)
+        self.store.setValues(3, 5750, [0] * 10)  # 절감률 (% × 10)
+        # 5800-5823: 그룹별 요약 데이터 (SWP, FWP, FAN, TOTAL)
+        self.store.setValues(3, 5800, [0] * 4)   # 그룹별 ESS 운전시간
+        self.store.setValues(3, 5804, [0] * 4)   # 그룹별 총 운전시간
+        self.store.setValues(3, 5808, [0] * 4)   # 그룹별 ESS 모드 소비량
+        self.store.setValues(3, 5812, [0] * 4)   # 그룹별 60Hz 기준 전력량
+        self.store.setValues(3, 5816, [0] * 4)   # 그룹별 절감량
+        self.store.setValues(3, 5820, [0] * 4)   # 그룹별 절감률
+        # 5900-5923: 오늘 ESS 데이터
+        self.store.setValues(3, 5900, [0] * 10)  # 오늘 개별 ESS 운전시간
+        self.store.setValues(3, 5910, [0] * 10)  # 오늘 개별 절감량
+        self.store.setValues(3, 5920, [0] * 4)   # 오늘 그룹별 절감량
+
         # 알람 시스템 레지스터 초기화
         # 7000-7009: 알람 임계값 설정 (HMI → PLC)
         default_thresholds = [
@@ -234,6 +254,7 @@ class ESSPLCSimulator:
         print("[INFO] Modbus TCP 서버: 192.168.0.130:502")
         print("[INFO] Node ID: 3")
         print("[INFO] Edge AI 결과 레지스터: 5000-5523 (Ready)")
+        print("[INFO] ESS 운전 데이터 레지스터: 5700-5923 (Ready)")
         print("[INFO] 알람 시스템 레지스터: 7000-7279 (Ready)")
         print("[INFO] 장비 상태 레지스터: 4000-4001 (Ready)")
         print("[INFO] VFD 데이터 레지스터: 160-359 (20 regs × 10 equip, 예방진단 포함)")
