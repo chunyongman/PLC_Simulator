@@ -250,7 +250,21 @@ class ESSPLCSimulator:
         self.recent_alarms = []  # 최근 알람 10개
         self.alarm_index = 0
 
+        # AUTO/MANUAL, VFD/BYPASS 코일 초기값 설정 (시작 시 한 번만)
+        # SWP1~3, FWP1~3, FAN1~4 = 10개 장비
+        equipment_names = ['SWP1', 'SWP2', 'SWP3', 'FWP1', 'FWP2', 'FWP3',
+                          'FAN1', 'FAN2', 'FAN3', 'FAN4']
+        for i, eq_name in enumerate(equipment_names):
+            eq = self.equipment[eq_name]
+            # AUTO/MANUAL 코일 (64160 + eq_index) - True=AUTO, False=MANUAL
+            auto_coil_addr = 64160 + i
+            self.store.setValues(1, auto_coil_addr, [1 if eq.get('auto_mode', True) else 0])
+            # VFD/BYPASS 코일 (64320 + eq_index) - True=VFD, False=BYPASS
+            vfd_coil_addr = 64320 + i
+            self.store.setValues(1, vfd_coil_addr, [1 if eq.get('vfd_mode', True) else 0])
+
         print("[OK] 데이터 스토어 초기화 완료")
+        print("[INFO] AUTO/MANUAL 코일: 64160-64169 (초기값: AUTO)")
         print("[INFO] Modbus TCP 서버: 192.168.0.130:502")
         print("[INFO] Node ID: 3")
         print("[INFO] Edge AI 결과 레지스터: 5000-5523 (Ready)")
@@ -600,7 +614,23 @@ class ESSPLCSimulator:
             auto_mode = eq.get('auto_mode', True)
             vfd_mode = eq.get('vfd_mode', True)
 
-            if auto_mode and vfd_mode and running:
+            # ========================================
+            # 모드별 주파수 결정 로직 (실제 PLC 동작 모사)
+            # ========================================
+            if not running:
+                # 정지 상태: 0Hz
+                vfd_command_freq = 0.0
+                vfd_actual_freq = 0.0
+            elif not vfd_mode:
+                # Bypass 모드: 60Hz 고정 (VFD 가변 주파수 비활성화)
+                vfd_command_freq = 60.0
+                vfd_actual_freq = 60.0
+            elif not auto_mode:
+                # 수동 모드 + VFD: 현재 주파수 유지 (AI 목표 무시, 변동 없음)
+                # vfd_command_freq는 이미 eq['hz']에서 읽어온 값
+                vfd_actual_freq = vfd_command_freq  # noise 없이 그대로 유지
+            else:
+                # 자동 + VFD 모드: Edge AI 목표 주파수 적용
                 try:
                     ai_freq_raw = self.store.getValues(3, 5000 + i, 1)[0]
                     if ai_freq_raw > 0:
@@ -614,12 +644,9 @@ class ESSPLCSimulator:
                             vfd_command_freq = ai_freq_hz
                 except:
                     pass
-
-            if running:
+                # 자동 모드에서만 약간의 변동 추가
                 vfd_actual_freq = vfd_command_freq + random.uniform(-0.3, 0.3)
                 vfd_actual_freq = max(0.0, min(60.0, vfd_actual_freq))
-            else:
-                vfd_actual_freq = 0.0
 
             eq['hz'] = vfd_command_freq
 
@@ -753,16 +780,10 @@ class ESSPLCSimulator:
             ]
             self.store.setValues(3, start_addr, vfd_data)
 
-        # AUTO/MANUAL, VFD/BYPASS 코일 업데이트
-        for i, (eq_name, _) in enumerate(vfd_configs):
-            eq = self.equipment[eq_name]
-            # AUTO/MANUAL 코일 (64160 + eq_index)
-            auto_coil_addr = 64160 + i
-            self.store.setValues(1, auto_coil_addr, [1 if eq.get('auto_mode', True) else 0])
-
-            # VFD/BYPASS 코일 (64320 + eq_index)
-            vfd_coil_addr = 64320 + i
-            self.store.setValues(1, vfd_coil_addr, [1 if eq.get('vfd_mode', True) else 0])
+        # AUTO/MANUAL, VFD/BYPASS 코일은 monitor_commands()에서 읽어서 equipment 상태 업데이트
+        # HMI가 코일을 쓰면 monitor_commands()가 감지하고 equipment 상태에 반영
+        # 여기서 코일을 다시 쓰면 HMI 명령이 덮어씌워지는 race condition 발생!
+        # 따라서 코일 쓰기는 제거하고, HMI가 코일 상태를 직접 읽도록 함
 
     def monitor_commands(self):
         """PLC 명령 모니터링 (HMI에서 전송하는 명령 처리)"""
@@ -891,9 +912,20 @@ class ESSPLCSimulator:
                 print(f"  동적온도: TX4={self.base_temps.get('TX4', 0):.1f}°C (FWP), "
                       f"TX5={self.base_temps.get('TX5', 0):.1f}°C (SWP), "
                       f"TX6={self.base_temps.get('TX6', 0):.1f}°C (FAN)")
-                print(f"  주파수: SWP1={self.equipment['SWP1']['hz']:.1f}Hz, "
-                      f"FWP1={self.equipment['FWP1']['hz']:.1f}Hz, "
-                      f"FAN1={self.equipment['FAN1']['hz']:.1f}Hz")
+                # 모드별 주파수 출력
+                def get_mode_str(eq):
+                    if not eq.get('vfd_mode', True):
+                        return "BYP"
+                    elif not eq.get('auto_mode', True):
+                        return "MAN"
+                    else:
+                        return "AUTO"
+                swp1_mode = get_mode_str(self.equipment['SWP1'])
+                fwp1_mode = get_mode_str(self.equipment['FWP1'])
+                fan1_mode = get_mode_str(self.equipment['FAN1'])
+                print(f"  주파수: SWP1={self.equipment['SWP1']['hz']:.1f}Hz({swp1_mode}), "
+                      f"FWP1={self.equipment['FWP1']['hz']:.1f}Hz({fwp1_mode}), "
+                      f"FAN1={self.equipment['FAN1']['hz']:.1f}Hz({fan1_mode})")
                 print(f"  M/E부하: {self.me_load:.1f}% | 다음알람: {90 - self.alarm_scenario_counter}초 후")
 
                 # VFD 이상 상태 출력
