@@ -857,7 +857,11 @@ class ESSPLCSimulator:
 
                         # BWD START (Fan only)
                         bwd_coil_addr = 64084 + (i - 6)
-                        bwd_coil_value = self.store.getValues(1, bwd_coil_addr, 1)[0]
+                        try:
+                            bwd_coil_value = self.store.getValues(1, bwd_coil_addr, 1)[0]
+                        except Exception as e:
+                            print(f"[DEBUG] {eq_name} BWD 코일 읽기 오류: {e}, addr={bwd_coil_addr}")
+                            bwd_coil_value = 0
                         if bwd_coil_value:
                             if not self.equipment[eq_name]['running_bwd']:
                                 self.equipment[eq_name]['running_fwd'] = False
